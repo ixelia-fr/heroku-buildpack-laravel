@@ -10,7 +10,7 @@ shopt -s extglob
 shopt -s nullglob
 
 if ! type -p "realpath" > /dev/null; then
-	# cedar-14 and macOS don't have realpath
+	# macOS doesn't have realpath
 	# readlink is not an option because BSD readlink does not have the GNU -f option
 	# must be a function so subshells, including $(…), can use it
 	realpath() {
@@ -336,10 +336,13 @@ if [[ -n ${fpm_config:-} || ( ${fpm_config:=$(findconfig "$php_version" "$bp_dir
 fi
 fpm_config=$(php_passthrough "$fpm_config")
 
-if [[ -n ${php_config:-} ]]; then
+# we explicitly use the INI file php-fpm would load if no INI is given
+# this is to ensure that e.g. our WEB_CONCURRENCY calculation doesn't pick up a php-cli.ini
+fpm_ini=$(php-fpm -i | awk -F' => ' '/^Loaded Configuration File/{print $2}')
+if [[ -n ${php_config:-} || ( "$fpm_ini" != "(none)" && ${php_config:=$fpm_ini} && $verbose ) ]]; then
 	echo "Using PHP configuration (php.ini) file '${php_config#$HEROKU_APP_DIR/}'" >&2
-	php_config=$(php_passthrough "$php_config")
 fi
+[[ -n ${php_config:-} ]] && php_config=$(php_passthrough "$php_config")
 
 if [[ -n ${httpd_config_include:-} || ( ${httpd_config_include:=$(findconfig "$httpd_version" "$bp_dir/conf/apache2/default_include.conf")} && $verbose ) ]]; then
 	echo "Using Apache2 VirtualHost-level configuration include '${httpd_config_include#$HEROKU_APP_DIR/}'" >&2
@@ -352,32 +355,30 @@ if [[ -n ${httpd_config:-} || ( ${httpd_config:=$(findconfig "$httpd_version" "$
 fi
 httpd_config=$(php_passthrough "$httpd_config")
 
-if [[ -z ${WEB_CONCURRENCY:-} ]]; then
-	maxprocs=$(ulimit -u)
+mlib="/sys/fs/cgroup/memory/memory.limit_in_bytes"
+if [[ -f "$mlib" ]]; then
+	ram="$(cat "$mlib")"
+	echo "Detected ${ram} Bytes of RAM" >&2
+else
 	ram="512M"
-	if [[ -n ${DYNO:-} && "$maxprocs" == "32768" ]]; then
-		echo "Optimizing defaults for PX dyno...." >&2
-		ram="6G"
-	elif [[ -n ${DYNO:-} && "$maxprocs" == "16384" ]]; then
-		echo "Optimizing defaults for IX dyno...." >&2
-		ram="2560M"
-	elif [[ -n ${DYNO:-} && "$maxprocs" == "512" ]]; then
-		echo "Optimizing defaults for 2X dyno..." >&2
-		ram="1G"
-	elif [[ -n ${DYNO:-} && "$maxprocs" == "256" ]]; then
-		echo "Optimizing defaults for 1X dyno..." >&2
-	elif [[ -n ${DYNO:-} || $verbose ]]; then
-		echo "No dyno detected; using defaults for 1X..." >&2
+	echo "Assuming ${ram}B of RAM" >&2
+fi
+if [[ -z ${WEB_CONCURRENCY:-} ]]; then
+	max_ram="16G" # blanket upper limit for how much RAM we will use for PHP, unless the machine has less anyway
+	if [[ -n ${DYNO:-} && $(ulimit -u) == "32768" && ( "$php_version" == 5.* || "$php_version" == 7.[0-3].* ) ]]; then
+		# on a Performance-L dyno, limit to 6 GB of RAM for backwards compatibility for PHP versions before 7.4
+		# this is to ensure that apps previously running on PX dynos (6 GB RAM) do not get a sudden jump in the number of worker processes
+		max_ram="6G"
 	fi
 
 	# determine number of FPM processes to run
-	read WEB_CONCURRENCY php_memory_limit <<<$(php ${php_config:+-c "$php_config"} "$bp_dir/bin/util/autotune.php" -y "$fpm_config" -t "$DOCUMENT_ROOT" "$ram")
+	read WEB_CONCURRENCY php_memory_limit <<<$(php ${php_config:+-c "$php_config"} "$bp_dir/bin/util/autotune.php" -y "$fpm_config" -t "$DOCUMENT_ROOT" "$ram" "$max_ram")
 	[[ $WEB_CONCURRENCY -lt 1 ]] && WEB_CONCURRENCY=1
 	export WEB_CONCURRENCY
 
-	echo "${WEB_CONCURRENCY} processes at ${php_memory_limit}B memory limit." >&2
+	echo "PHP memory_limit is ${php_memory_limit} Bytes" >&2
 else
-	echo "Using WEB_CONCURRENCY=${WEB_CONCURRENCY} processes." >&2
+	echo '$WEB_CONCURRENCY env var is set, skipping automatic calculation' >&2
 fi
 
 # make a shared pipe; we'll write the name of the process that exits to it once that happens, and wait for that event below
@@ -388,6 +389,10 @@ mkfifo $wait_pipe
 exec 3<> $wait_pipe
 
 pids=()
+graceful_sigterm=
+if [[ "${HEROKU_PHP_GRACEFUL_SIGTERM:-0}" != "0" ]]; then
+	graceful_sigterm=1
+fi
 
 # trap SIGTERM (for when we get killed) and EXIT (upon failure of any command due to set -e, or because of the exit at the very end), we then
 # 1) restore the trap for the signal in question so it doesn't fire again due to the kill at the end of the trap, as well as for EXIT, because that would fire too
@@ -400,7 +405,7 @@ pids=()
 # 3) as the signal to subshells, we use SIGUSR1 if we're getting a SIGTERM or SIGINT (for graceful shutdown), and a SIGTERM otherwise
 # 3a) this is so subshells can tell whether we sent them the signal and they should in turn stop gracefully (SIGUSR1)...
 # 3b) ... or if something crashed, or e.g. Heroku's process manager sent SIGTERM to all processes in the group, in which case a graceful shutdown attempt is futile anyway
-# 3c) SIGINT oder SIGQUIT are not an option since backgrounded subshells cannot trap them (http://vaab.blog.kal.fr/2016/07/30/trapping-sigint-sigquit-in-asynchronous-tasks/)
+# 3c) SIGINT oder SIGQUIT are not an option since backgrounded subshells cannot trap them (http://vaab.blog.kal.fr/2016/07/30/trapping-sigint-sigquit-in-asynchronous-tasks/) in Bash 3 (it works in Bash 4+ in interactive shells at least)
 # 4) kill ourselves with the correct signal in case we're handling SIGTERM or, further down, SIGINT (http://www.cons.org/cracauer/sigint.html and http://mywiki.wooledge.org/SignalTrap#Special_Note_On_SIGINT1)
 cleanup() {
 	signal=${1:-TERM}
@@ -413,9 +418,11 @@ cleanup() {
 	rm -f ${wait_pipe} || true;
 	echo "Shutdown complete." >&2
 }
+# we always try to shut down gracefully on SIGTERM
+# this may not work depending on env vars and platform behavior, but the subshells will take care of those details
 trap 'trap - TERM EXIT; echo "SIGTERM received, attempting graceful shutdown..." >&2; cleanup USR1; kill -TERM $$' TERM
 # on "regular" EXIT (i.e. when we reached the end of the script because a process exited unexpectedly) just clean up and let the exit status bubble through (see last line)
-trap 'trap - EXIT; echo "Process exited unexpectedly: $exitproc, shutting down..." >&2; cleanup TERM' EXIT
+trap 'trap - EXIT; echo "Process exited unexpectedly: $exitproc, shutting down..." >&2; cleanup USR1' EXIT
 
 # if FD 1 is a TTY (that's the -t 1 check), trap SIGINT/Ctrl+C, then same procedure as for TERM above
 if [[ -t 1 ]]; then
@@ -465,13 +472,32 @@ fi
 		sedbufarg="-u" # unix/gnu sed: -u unbuffered (arbitrary) chunks of data
 	fi
 
-	tail -qF -n 0 "${logs[@]}" > "$logs_pipe" & logs_procs+=($!)
-	sed $sedbufarg -E -e 's/^\[[^]]+\] WARNING: \[pool [^]]+\] child [0-9]+ said into std(err|out): "(.*)("|...)$/\2\3/' -e 's/"$//' < "$logs_pipe" 1>&2 & logs_procs+=($!) # messages that are too long are cut off using "..." by FPM instead of closing double quotation marks; we want to preserve those three dots but not the closing double quotes
+	# we need 'tail' and 'sed' to ignore SIGTERM as well
+	# we do that by setting the handler for SIGTERM to SIG_IGN, then exec-ing the program, which preserves the signal handler (see https://pubs.opengroup.org/onlinepubs/9699919799/functions/execle.html):
+	# "Signals set to the default action (SIG_DFL) in the calling process image shall be set to the default action in the new process image. Except for SIGCHLD, signals set to be ignored (SIG_IGN) by the calling process image shall be set to be ignored by the new process image. Signals set to be caught by the calling process image shall be set to the default action in the new process image (see <signal.h>)."
+	# this of course doesn't work in more complex cases like Nginx or Apache or PHP, which install their own signal handlers on startup, but tail and sed don't do that
+	(
+		[[ $graceful_sigterm ]] && trap '' TERM
+		exec tail -qF -n 0 "${logs[@]}" > "$logs_pipe"
+	) & logs_procs+=($!)
+	(
+		[[ $graceful_sigterm ]] && trap '' TERM
+		# messages that are too long are cut off using "..." by FPM instead of closing double quotation marks; we want to preserve those three dots but not the closing double quotes
+		exec sed $sedbufarg -E -e 's/^\[[^]]+\] WARNING: \[pool [^]]+\] child [0-9]+ said into std(err|out): "(.*)("|...)$/\2\3/' -e 's/"$//' < "$logs_pipe" 1>&2
+	) & logs_procs+=($!)
 	# after the kill, we are redirecting stderr to /dev/null using exec to suppress "… Terminated …" messages from the shell, which it would print right before the next command is invoked
-	trap '[[ $verbose ]] && echo "Stopping log redirection..." >&2; kill -TERM "${logs_procs[@]}" 2> /dev/null || true; exec 2> /dev/null' TERM USR1
+	# we have to send SIGHUP to each process (could also use SIGUSR1 or any other process where the default behavior is termination, see https://man7.org/linux/man-pages/man7/signal.7.html); SIGQUIT or SIGINT doesn't work - this is because of the SIG_IGN workaround above, which is done using a backgrounded subshell and an exec - and backgrounded subshells cannot trap SIGTERM or SIGINT: http://vaab.blog.kal.fr/2016/07/30/trapping-sigint-sigquit-in-asynchronous-tasks/
+	trap '[[ $verbose ]] && echo "Stopping log redirection..." >&2; kill -HUP "${logs_procs[@]}" 2> /dev/null || true; exec 2> /dev/null' USR1
+	# ignore process group wide SIGTERM for this subshell if that env var is set
+	if [[ $graceful_sigterm ]]; then
+		trap '' TERM
+	else
+		trap '[[ $verbose ]] && echo "Stopping log redirection..." >&2; kill -TERM "${logs_procs[@]}" 2> /dev/null || true; exec 2> /dev/null' TERM
+	fi
 
 	wait 2> /dev/null || true # redirect stderr to prevent possible trap race condition warnings
-	trap - TERM USR1
+	trap - USR1
+	[[ $graceful_sigterm ]] || trap - TERM # only reset to default if we're not ignoring, or a SIGTERM from the outside that tries to kill all running processes might arrive just in this moment to unblock the next wait
 	wait 2> /dev/null || true # redirect stderr to prevent possible trap race condition warnings
 ) & pids+=($!)
 
@@ -480,7 +506,7 @@ fpm_pidfile=$(mktemp -t "heroku.php-fpm.pid-$PORT.XXXXXX" -u)
 	trap 'echo "php-fpm" >&3;' EXIT
 	trap '' INT;
 
-	echo "Starting php-fpm..." >&2
+	echo "Starting php-fpm with ${WEB_CONCURRENCY} workers..." >&2
 
 	# earlier, we added special INIs that prevent newrelic etc from starting to the scan dir
 	# we do not want that to apply to php-fpm, which uses the same scan dir for its configs as the regular PHP CLI SAPI
@@ -493,11 +519,17 @@ fpm_pidfile=$(mktemp -t "heroku.php-fpm.pid-$PORT.XXXXXX" -u)
 
 	php-fpm --pid "$fpm_pidfile" --nodaemonize -y "$fpm_config" ${php_config:+-c "$php_config"} & pid=$!
 	# wait for the pidfile in the trap; otherwise, a previous subshell failing may result in us getting a SIGTERM and forwarding it to the child process before that child process is ready to process signals
-	trap 'echo "Stopping php-fpm..." >&2; wait_pid_and_pidfile $pid "$fpm_pidfile"; kill -TERM $pid 2> /dev/null || true' TERM
 	trap 'echo "Stopping php-fpm gracefully..." >&2; wait_pid_and_pidfile $pid "$fpm_pidfile"; kill -QUIT $pid 2> /dev/null || true' USR1
+	# we always want to try and stop gracefully, especially since on Heroku we might be getting a process group wide SIGTERM but running a patched PHP-FPM that ignores SIGTERM; so if that env var is set, we ignore SIGTERM in this subshell as well
+	if [[ $graceful_sigterm ]]; then
+		trap '' TERM
+	else
+		trap 'echo "Stopping php-fpm..." >&2; wait_pid_and_pidfile $pid "$fpm_pidfile"; kill -TERM $pid 2> /dev/null || true' TERM
+	fi
 
 	wait $pid 2> /dev/null || true # redirect stderr to prevent possible trap race condition warnings
-	trap - TERM USR1
+	trap - USR1
+	[[ $graceful_sigterm ]] || trap - TERM # only reset to default if we're not ignoring, or a SIGTERM from the outside that tries to kill all running processes might arrive just in this moment to unblock the next wait
 	wait $pid 2> /dev/null || true # redirect stderr to prevent possible trap race condition warnings
 ) & pids+=($!)
 
@@ -516,8 +548,13 @@ httpd_pidfile=$(httpd -t -D DUMP_RUN_CFG 2> /dev/null | sed -n -E 's/PidFile: "(
 
 	httpd -D NO_DETACH -c "Include $httpd_config" & pid=$!
 	# wait for the pidfile in the trap; otherwise, a previous subshell failing may result in us getting a SIGTERM and forwarding it to the child process before that child process is ready to process signals
-	trap 'echo "Stopping httpd..." >&2; wait_pid_and_pidfile $pid "$httpd_pidfile"; kill -TERM $pid 2> /dev/null || true' TERM
 	trap 'echo "Stopping httpd gracefully..." >&2; wait_pid_and_pidfile $pid "$httpd_pidfile"; kill -WINCH $pid 2> /dev/null || true' USR1
+	# we always want to try and stop gracefully, especially since on Heroku we might be getting a process group wide SIGTERM but running a patched HTTPD that ignores SIGTERM; so if that env var is set, we ignore SIGTERM in this subshell as well
+	if [[ $graceful_sigterm ]]; then
+		trap '' TERM
+	else
+		trap 'echo "Stopping httpd..." >&2; wait_pid_and_pidfile $pid "$httpd_pidfile"; kill -TERM $pid 2> /dev/null || true' TERM
+	fi
 
 	# first, we wait for the pid file to be written, so that we can emit a ready message
 	wait_pid_and_pidfile $pid "$httpd_pidfile"
@@ -525,7 +562,8 @@ httpd_pidfile=$(httpd -t -D DUMP_RUN_CFG 2> /dev/null | sed -n -E 's/PidFile: "(
 	[[ -z ${DYNO:-} || $verbose ]] && kill -0 $pid 2> /dev/null && echo "Application ready for connections on port $PORT." >&2
 
 	wait $pid 2> /dev/null || true # redirect stderr to prevent possible trap race condition warnings
-	trap - TERM USR1
+	trap - USR1
+	[[ $graceful_sigterm ]] || trap - TERM # only reset to default if we're not ignoring, or a SIGTERM from the outside that tries to kill all running processes might arrive just in this moment to unblock the next wait
 	wait $pid 2> /dev/null || true # redirect stderr to prevent possible trap race condition warnings
 ) & pids+=($!)
 
