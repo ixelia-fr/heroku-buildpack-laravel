@@ -1,118 +1,55 @@
-<h1 align="center">Heroku Buildpack: Laravel</h1>
-<p align="center"><img src="assets/laravel-heroku.jpg" alt="Laravel Heroku Buildpack"></p>
-<p align="center">
-	Forked from the Official <a href="https://github.com/heroku/heroku-buildpack-php">Heroku PHP Buildpack</a> with added support for Laravel Applications.
-</p>
+# Heroku buildpack: PHP [![Build Status](https://travis-ci.com/heroku/heroku-buildpack-php.svg?branch=main)](https://travis-ci.com/heroku/heroku-buildpack-php)
+
+![php](https://cloud.githubusercontent.com/assets/51578/8882982/73ea501a-3219-11e5-8f87-311e6b8a86fc.jpg)
 
 
+This is the official [Heroku buildpack](http://devcenter.heroku.com/articles/buildpacks) for PHP applications.
 
+It uses Composer for dependency management, supports all recent versions of PHP as runtimes, and offers a choice of Apache2 or Nginx web servers.
 
 ## Usage
 
 You'll need to use at least an empty `composer.json` in your application.
 
-```sh
-echo '{}' > composer.json
-git add composer.json
-git commit -m "add composer.json for PHP app detection"
-```
+    $ echo '{}' > composer.json
+    $ git add composer.json
+    $ git commit -m "add composer.json for PHP app detection"
 
 If you also have files from other frameworks or languages that could trigger another buildpack to detect your application as one of its own, e.g. a `package.json` which might cause your code to be detected as a Node.js application even if it is a PHP application, then you need to manually set your application to use this buildpack:
 
-```sh
-heroku buildpacks:set gerardbalaoro/laravel
-``` 
-The `gerardbalaoro/laravel` buildpack from the [Heroku Registry](https://devcenter.heroku.com/articles/buildpack-registry) represents the latest stable version of the buildpack. If you'd like to use the code from this Github repository, you can set your buildpack to the Github URL:
+    $ heroku buildpacks:set heroku/php
 
-```sh
-heroku buildpacks:set https://github.com/gerardbalaoro/heroku-buildpack-laravel.git
-```
+This will use the officially published version. To use the default branch from GitHub instead:
 
+    $ heroku buildpacks:set https://github.com/heroku/heroku-buildpack-php
 
 Please refer to [Dev Center](https://devcenter.heroku.com/categories/php) for further usage instructions.
 
+## Custom Platform Repositories
 
+The buildpack uses Composer repositories to resolve platform (`php`, `ext-something`, ...) dependencies.
 
-## Environment Variables
+To use a custom Composer repository with additional or different platform packages, add the URL to its `packages.json` to the `HEROKU_PHP_PLATFORM_REPOSITORIES` config var:
 
-The buildpack will **replace** the existing **.env** file using variables from your **Heroku Config Vars**.
+    $ heroku config:set HEROKU_PHP_PLATFORM_REPOSITORIES="https://mybucket.s3.amazonaws.com/heroku-18/packages.json"
 
-### Generic Variables
+To allow the use of multiple custom repositories, the config var may hold a list of multiple repository URLs, separated by a space character, in ascending order of precedence.
 
-The buildpack will recognize the **APP_**, **DB_**, and **MAIL_** variables set in Heroku.
+If the first entry in the list is "`-`" instead of a URL, the default platform repository is disabled entirely. This can be useful when testing development repositories, or to forcefully prevent the use of unwanted packages from the default platform repository.
 
-```sh
-# Adds APP_NAME="Laravel App" to .env file
-heroku config:set APP_NAME="Laravel App"
-```
+For instructions on how to build custom platform packages (and a repository to hold them), please refer to the instructions [further below](#custom-platform-packages-and-repositories).
 
-The following are the supported application variables:
-- APP_NAME
-- APP_ENV
-- APP_DEBUG
-- APP_URL
+**Please note that Heroku cannot provide support for issues related to custom platform repositories and packages.**
 
-For database configuration variables:
-- DB_CONN (Database Driver)
-- DB_HOST
-- DB_PORT
-- DB_USER
-- DB_PASS
-- DB_NAME (Database Name)
+## Development
 
-For email configuration variables:
-- MAIL_DRIVER
-- MAIL_HOST
-- MAIL_USER
-- MAIL_PASS
-- MAIL_PORT
+The following information only applies if you're forking and hacking on this buildpack for your own purposes.
 
-### Additional Variables
+### Pull Requests
 
-For environment variables not metioned above, define them in the config variable **LARAVEL_ENV_VARS** and it will automatically be appended to the **.env** file.
+Please submit all pull requests against `develop` as the base branch.
 
-```sh
-# Adds BROADCAST_DRIVER=log to .env file
-heroku config:set LARAVEL_ENV_VARS=BROADCAST_DRIVER=log
-```
+### Custom Platform Packages and Repositories
 
-Unfortunately, the `heroku config:set` command only works for single-line strings, for multiple environment variables, set them at your Heroku application dashboard under the settings tab.
+Please refer to the [README in `support/build/`](support/build/README.md) for instructions.
 
-![Set Laravel Environment Variables](assets/laravel-env-vars.jpg)
-
-
-
-## Laravel Commands
-
-The buildpack automatically runs the following artisan commands:
-
-```sh
-php artisan key:generate
-php artisan view:clear
-```
-
-To run additional commands, set assign them to the config variable **LARAVEL_COMMANDS**
-
-```sh
-# Executes php artisan migrate and php artisan db:seed
-heroku config:set LARAVEL_COMMANDS=php artisan migrate && php artisan db:seed
-```
-
-
-
-## HTTP Basic Authentication
-This will generate an **.htpasswd** file based on the config variable **HT_AUTH**
-
-```sh
-# Executes htpasswd -cb .htpasswd {username} {password}
-heroku config:set HT_AUTH={username} {password}
-```
-
-It will also append the authentication code in **public/.htaccess**
-
-```apache
-AuthType Basic
-AuthName "Restricted Access"
-AuthUserFile /app/.htpasswd
-Require valid-user
-```
